@@ -20,8 +20,10 @@ import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_AC_WRITE
 from capstone.x86_const import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
+from pipeline_config import PipelineConfig
 
-@dataclass
+
+@dataclass(slots=True)
 class Insn:
     addr: int          # VA
     file_off: int      # file offset
@@ -85,6 +87,7 @@ class DisasmResult:
     dynamic_base: bool = False   # IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
     has_reloc_dir: bool = False
     file_size: int = 0
+    split_on_call: bool = True  # контракт пайплайна; должен совпадать с PipelineConfig
 
 
 COND_JMPS = {
@@ -119,6 +122,16 @@ for _n in range(8, 16):
 
 def parent(reg: str) -> str:
     return _PARENTS.get(reg.lower(), reg.lower())
+
+
+def jump_table_entry_is_signed(scale: int) -> bool:
+    """8-байтные слоты — абсолютные VA; 2/4-байтные — знаковые смещения."""
+    return scale != 8
+
+
+def decode_jump_table_entry(raw: bytes, *, signed: bool) -> int:
+    """Прочитать элемент jump-таблицы (little-endian, опционально signed)."""
+    return int.from_bytes(raw, "little", signed=signed)
 
 
 @dataclass
@@ -220,11 +233,17 @@ def _parse_pe(path) -> PEInfo:
                   func_bounds=func_bounds, file_size=file_size)
 
 
-def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
+def disassemble(path: str, cfg: PipelineConfig | None = None,
+                split_on_call: bool | None = None) -> DisasmResult:
     """Рекурсивный спуск: worklist (entry + .pdata begin), trace-линии с
     остановкой на терминалах, резолвинг jump-таблиц. split_on_call=True —
     блок закрывается на call (гранулярность для Модуля 3), False —
-    классические basic blocks для IR (Модуля 2)."""
+    классические basic blocks для IR (Модуля 2).
+
+    cfg и split_on_call должны согласовываться через PipelineConfig.from_legacy.
+    """
+    cfg = PipelineConfig.from_legacy(split_on_call, cfg)
+    split_on_call = cfg.split_on_call
     info = _parse_pe(path)
     imagebase, entry_va = info.imagebase, info.entry_va
     sections, exec_ranges = info.sections, info.exec_ranges
@@ -240,9 +259,16 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
     exec_spans = [(va, va + len(code)) for va, _, code, _ in exec_ranges]
     exec_sorted = sorted(exec_ranges)
     exec_starts = [r[0] for r in exec_sorted]
+    # Отсортированные полуинтервалы [start, end) для O(log n) in_exec.
+    _exec_sorted_spans = sorted(exec_spans)
+    _exec_span_starts = [s for s, _ in _exec_sorted_spans]
 
     def in_exec(va: int) -> bool:
-        return any(a <= va < b for a, b in exec_spans)
+        k = bisect_right(_exec_span_starts, va) - 1
+        if k < 0:
+            return False
+        s, e = _exec_sorted_spans[k]
+        return s <= va < e
 
     def va2file(va: int):
         for _name, sva, vsize, raw_ptr, raw_size, _is_exec in sections:
@@ -345,7 +371,7 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
             b = read_at(va, scale)
             if b is None:
                 break
-            val = int.from_bytes(b, "little", signed=signed and scale < 8)
+            val = decode_jump_table_entry(b, signed=signed and scale < 8)
             hit = None
             for c in cand_fn(val):
                 if not in_exec(c):
@@ -402,7 +428,10 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
             return (val,) if scale == 8 else (imagebase + val, tv + val)
 
         lo, hi = table_range(ins.addr)
-        tgts = read_table(tv, scale, cand_fn, lo, hi)
+        # scale == 4 / 2 — таблицы знаковых смещений (MSVC/clang pattern):
+        # отрицательные элементы валидны и дают targets слева от таблицы.
+        tgts = read_table(tv, scale, cand_fn, lo, hi,
+                          signed=jump_table_entry_is_signed(scale))
         return (table_va, tgts) if tgts else None
 
     def _deco(ins: Insn):
@@ -678,7 +707,8 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
                 _trace_from(worklist.popleft())
 
     insns.sort(key=lambda x: x.addr)
-    blocks = _build_blocks(insns, by_addr, split_on_call=split_on_call)
+    blocks = _build_blocks(insns, by_addr, split_on_call=split_on_call,
+                           func_bounds=func_bounds)
 
     covered = []
     for ins in insns:
@@ -711,7 +741,8 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
                         gaps=gaps, func_bounds=func_bounds,
                         jump_tables=jump_tables,
                         is_dll=is_dll, dynamic_base=dynamic_base,
-                        has_reloc_dir=has_reloc_dir, file_size=file_size)
+                        has_reloc_dir=has_reloc_dir, file_size=file_size,
+                        split_on_call=split_on_call)
 
 
 def _block_ends(ins, split_on_call: bool) -> bool:
@@ -722,13 +753,24 @@ def _block_ends(ins, split_on_call: bool) -> bool:
     return False
 
 
-def _build_blocks(insns, by_addr, split_on_call: bool = True):
+def _build_blocks(insns, by_addr, split_on_call: bool = True, func_bounds=()):
     def is_branch(ins):
         return ins.is_cond_jmp or ins.is_uncond_jmp or ins.is_call or ins.is_loop
 
     starts = set()
     if insns:
         starts.add(insns[0].addr)
+    # Начало каждой функции из .pdata — обязательная граница блока:
+    # иначе рядом стоящие в сортированном списке функции могут слиться.
+    for begin, _end in func_bounds:
+        if begin in by_addr:
+            starts.add(begin)
+    # Разрыв адресов между соседними visited-инструкциями (gap/dead code
+    # между трассами, noreturn-call) — тоже граница блока.
+    for k in range(1, len(insns)):
+        prev, cur = insns[k - 1], insns[k]
+        if prev.addr + prev.size != cur.addr:
+            starts.add(cur.addr)
     for ins in insns:
         if is_branch(ins):
             if ins.branch_target is not None and ins.branch_target in by_addr:
@@ -824,7 +866,8 @@ def _build_blocks(insns, by_addr, split_on_call: bool = True):
 
 def verify(r: DisasmResult):
     """Инварианты модуля 1. errors = битая структура (должно быть пусто).
-    warnings = подозрительные места (фантомные call-цели, перекрытия инструкций)."""
+    warnings = подозрительные места (фантомные call-цели, низкое покрытие .pdata).
+    Перекрывающиеся инструкции — error: Mod3 независимо мутирует оба stream."""
     errors, warnings = [], []
     starts = {b.start for b in r.blocks}
     for b in r.blocks:
@@ -841,7 +884,7 @@ def verify(r: DisasmResult):
     prev = None
     for i in r.insns:
         if prev is not None and prev.addr + prev.size > i.addr:
-            warnings.append(f"insn {i.addr:#x}: overlaps insn {prev.addr:#x}")
+            errors.append(f"insn {i.addr:#x}: overlaps insn {prev.addr:#x}")
         prev = i
         if i.file_off < 0 or i.file_off + i.size > r.file_size:
             errors.append(f"insn {i.addr:#x}: file_off out of range")
