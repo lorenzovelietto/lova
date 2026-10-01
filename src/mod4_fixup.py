@@ -14,16 +14,17 @@ Exit 0 = PASS, 1 = FAIL.
 import argparse
 import gc
 import os
-import re
 import struct
 import sys
 from bisect import bisect_left
 from types import SimpleNamespace
 
 import pefile
+from capstone import CS_GRP_CALL, CS_GRP_RET, CS_GRP_JUMP
 
 from mod1_disasm import disassemble, verify
 from mod2_ir import _effect
+from pipeline_config import PipelineConfig
 
 RELOC_SLOT = {1: 2, 2: 2, 3: 4, 4: 4, 10: 8}
 CHECKSUM_OFF = 64
@@ -55,15 +56,19 @@ DIFF_CHUNK = 1 << 20
 def diff_offsets(data_o, data_m):
     if data_o == data_m:
         return []
+    # Чанк-сравнение (дешёвое, PE обычно отличается в сотне-другой байт),
+    # а внутри изменённого чанка — байтовый zip. int.from_bytes на мегабайтных
+    # буферах создавал bigint порядка 2**(8*2**20) — ненужная работа.
     offs = []
+    mv_o, mv_m = memoryview(data_o), memoryview(data_m)
     for base in range(0, len(data_o), DIFF_CHUNK):
-        a = data_o[base:base + DIFF_CHUNK]
-        b = data_m[base:base + DIFF_CHUNK]
+        end = min(base + DIFF_CHUNK, len(data_o))
+        a, b = mv_o[base:end], mv_m[base:end]
         if a == b:
             continue
-        x = (int.from_bytes(a, "little") ^ int.from_bytes(b, "little"))
-        x = x.to_bytes(len(a), "little")
-        offs.extend(base + m.start() for m in re.finditer(rb"[^\x00]", x))
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                offs.append(base + i)
     return offs
 
 
@@ -72,22 +77,26 @@ def _stack_delta(result, addr, md):
     det = next(md.disasm(insn.raw, insn.addr), None)
     if det is None:
         return None
+    # Control-flow флаги — из capstone groups, не из хардкода.
+    gs = set(det.groups)
     fake = SimpleNamespace(
         mnemonic=det.mnemonic, addr=det.address,
         regs_read=tuple(md.reg_name(r) for r in det.regs_read),
         regs_write=tuple(md.reg_name(r) for r in det.regs_write),
-        is_call=False, is_ret=False, is_uncond_jmp=False,
+        is_call=CS_GRP_CALL in gs, is_ret=CS_GRP_RET in gs,
+        is_uncond_jmp=CS_GRP_JUMP in gs,
         is_cond_jmp=False, is_loop=False)
     return _effect(fake, det, md, result.imports).stack_delta
 
 
-def fixup(orig_path, mut_path):
+def fixup(orig_path, mut_path, cfg: PipelineConfig | None = None):
+    cfg = PipelineConfig.from_legacy(cfg=cfg)
     rep = {"errors": [], "warns": [], "stats": {}}
     st = rep["stats"]
     errs = rep["errors"]
 
-    ro = disassemble(orig_path)
-    rm = disassemble(mut_path)
+    ro = disassemble(orig_path, cfg=cfg)
+    rm = disassemble(mut_path, cfg=cfg)
     data_o = open(orig_path, "rb").read()
     data_m = open(mut_path, "rb").read()
 
@@ -104,13 +113,15 @@ def fixup(orig_path, mut_path):
     pdata = next((s for s in ro.sections if s[0].startswith(".pdata")), None)
     st["pdata_funcs"] = (pdata[4] // 12) if pdata and pdata[4] else 0
 
-    text = next((s for s in ro.sections if s[5]), None)
+    exec_secs = [s for s in ro.sections if s[5]]
+    exec_file_spans = [(s[3], s[3] + s[4]) for s in exec_secs if s[3] and s[4]]
+    exec_ids = {id(s) for s in exec_secs}
     for s in ro.sections:
-        if s is text or not s[4] or not s[3]:
+        if id(s) in exec_ids or not s[4] or not s[3]:
             continue
         fo, sz = s[3], s[4]
         if data_o[fo:fo + sz] != data_m[fo:fo + sz]:
-            errs.append(f"data changed outside .text: section {s[0]}")
+            errs.append(f"data changed outside executable sections: section {s[0]}")
 
     e_lfanew = struct.unpack_from("<I", data_o, 0x3C)[0]
     cs_lo = e_lfanew + 24 + CHECKSUM_OFF
@@ -119,11 +130,11 @@ def fixup(orig_path, mut_path):
     diff_offs = [o for o in diff_all if not (cs_lo <= o < cs_hi)]
     st["changed_bytes"] = len(diff_offs)
     st["checksum_bytes_patched"] = len(diff_all) - len(diff_offs)
-    if text:
-        t_lo, t_hi = text[3], text[3] + text[4]
-        outside = [o for o in diff_offs if not (t_lo <= o < t_hi)]
+    if exec_file_spans:
+        outside = [o for o in diff_offs
+                   if not any(lo <= o < hi for lo, hi in exec_file_spans)]
         if outside:
-            errs.append(f"{len(outside)} changed bytes outside .text "
+            errs.append(f"{len(outside)} changed bytes outside executable sections "
                         f"(first: {[hex(x) for x in outside[:5]]})")
 
     addr_o, addr_m = set(ro.by_addr), set(rm.by_addr)
@@ -219,6 +230,14 @@ def fixup(orig_path, mut_path):
     if old_cs != new_cs:
         rep["warns"].append(f"PE checksum stale: stored {old_cs:#010x}, "
                             f"computed {new_cs:#010x} (run with --apply)")
+    try:
+        dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]  # IMAGE_DIRECTORY_ENTRY_SECURITY
+        if dd.VirtualAddress and dd.Size:
+            rep["warns"].append(
+                "Authenticode signature present; mutations invalidate the signature"
+            )
+    except Exception:
+        pass
     rep["checksum_fix"] = new_cs
     return rep
 
