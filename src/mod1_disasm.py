@@ -21,7 +21,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_AC_WRITE
 from capstone.x86_const import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
 
-@dataclass
+@dataclass(slots=True)
 class Insn:
     addr: int          # VA
     file_off: int      # file offset
@@ -240,9 +240,16 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
     exec_spans = [(va, va + len(code)) for va, _, code, _ in exec_ranges]
     exec_sorted = sorted(exec_ranges)
     exec_starts = [r[0] for r in exec_sorted]
+    # Отсортированные полуинтервалы [start, end) для O(log n) in_exec.
+    _exec_sorted_spans = sorted(exec_spans)
+    _exec_span_starts = [s for s, _ in _exec_sorted_spans]
 
     def in_exec(va: int) -> bool:
-        return any(a <= va < b for a, b in exec_spans)
+        k = bisect_right(_exec_span_starts, va) - 1
+        if k < 0:
+            return False
+        s, e = _exec_sorted_spans[k]
+        return s <= va < e
 
     def va2file(va: int):
         for _name, sva, vsize, raw_ptr, raw_size, _is_exec in sections:
