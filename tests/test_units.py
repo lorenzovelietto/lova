@@ -67,6 +67,17 @@ class TestMod1Helpers(unittest.TestCase):
         self.assertEqual(parent("sil"), "rsi")
         self.assertEqual(parent("xmm0"), "xmm0")
 
+    def test_control_flags_jcc_is_not_uncond(self):
+        from mod1_disasm import control_flags
+        jne = control_flags("jne")
+        self.assertTrue(jne["is_cond_jmp"])
+        self.assertFalse(jne["is_uncond_jmp"])
+        jmp = control_flags("jmp")
+        self.assertTrue(jmp["is_uncond_jmp"])
+        self.assertFalse(jmp["is_cond_jmp"])
+        self.assertTrue(control_flags("call")["is_call"])
+        self.assertTrue(control_flags("ret")["is_ret"])
+
     def test_jump_table_signedness(self):
         self.assertTrue(jump_table_entry_is_signed(4))
         self.assertTrue(jump_table_entry_is_signed(2))
@@ -127,14 +138,17 @@ class TestMod2Liveness(unittest.TestCase):
         block = BasicBlock(start=0x1000, insns=[a, b])
         mod = IRModule(path="")
         mod.effects[a.addr] = IREffect(addr=a.addr)
-        # Originally B does not def rax, so rax is live after A.
+        # Originally B does not def rax, so rax is live after A and in live_in.
         mod.effects[b.addr] = IREffect(addr=b.addr)
         mod.live_after[a.addr] = {"rax"}
         mod.live_after[b.addr] = set()
+        mod.live_in[block.start] = {"rax"}
         # Mutate B: now it defs rax, so rax should die before B.
         mod.effects[b.addr] = IREffect(addr=b.addr, reg_def=frozenset({"rax"}))
-        recompute_live_after_prefix(block, mod, mutated_idx=1)
+        changed = recompute_live_after_prefix(block, mod, mutated_idx=1)
         self.assertNotIn("rax", mod.live_after[a.addr])
+        self.assertTrue(changed)
+        self.assertNotIn("rax", mod.live_in[block.start])
 
     def test_step_live_mstar_does_not_kill(self):
         live = {"m:*", "rax"}

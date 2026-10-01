@@ -50,6 +50,61 @@ class Insn:
     rip_ref: int | None = None         # absolute VA if RIP-relative mem (для IAT это СЛОТ, не цель!)
     import_name: str | None = None     # "dll.func" если rip_ref/branch_target попал в IAT
     section: str = ""
+    operands: tuple = ()               # CachedOp — без повторного Capstone-decode
+
+
+@dataclass(slots=True)
+class CachedMem:
+    base: str | None = None
+    index: str | None = None
+    scale: int = 1
+    disp: int = 0
+
+
+@dataclass(slots=True)
+class CachedOp:
+    """POD-операнд. type — константа capstone (X86_OP_*), reg/base/index — имена."""
+    type: int
+    access: int = 0
+    size: int = 0
+    reg: str | None = None
+    imm: int | None = None
+    mem: CachedMem | None = None
+
+
+def cache_operands(cs_insn, md) -> tuple:
+    """Снять операнды с CsInsn в POD. md нужен только здесь, не на каждом reuse."""
+    ops = []
+    for op in cs_insn.operands:
+        cop = CachedOp(type=op.type,
+                       access=int(getattr(op, "access", 0) or 0),
+                       size=int(getattr(op, "size", 0) or 0))
+        if op.type == X86_OP_REG:
+            try:
+                cop.reg = md.reg_name(op.reg)
+            except Exception:
+                cop.reg = None
+        elif op.type == X86_OP_IMM:
+            cop.imm = op.imm
+        elif op.type == X86_OP_MEM:
+            try:
+                base = md.reg_name(op.mem.base) if op.mem.base else None
+            except Exception:
+                base = None
+            try:
+                index = md.reg_name(op.mem.index) if op.mem.index else None
+            except Exception:
+                index = None
+            cop.mem = CachedMem(base=base, index=index,
+                                scale=op.mem.scale or 1, disp=op.mem.disp)
+        ops.append(cop)
+    return tuple(ops)
+
+
+def as_detail(ins: Insn):
+    """Duck-type CsInsn для _effect: operands + address/size/mnemonic."""
+    return SimpleNamespace(operands=ins.operands, mnemonic=ins.mnemonic,
+                           address=ins.addr, size=ins.size)
 
 
 @dataclass
@@ -88,6 +143,9 @@ class DisasmResult:
     has_reloc_dir: bool = False
     file_size: int = 0
     split_on_call: bool = True  # контракт пайплайна; должен совпадать с PipelineConfig
+    guard_cf: bool = False
+    export_vas: tuple = ()
+    tls_callbacks: tuple = ()
 
 
 COND_JMPS = {
@@ -96,6 +154,18 @@ COND_JMPS = {
     "jnle", "jno", "jnp", "jns", "jo", "jp", "jpe", "jpo", "js",
 }
 LOOP_INSNS = {"loop", "loope", "loopne", "loopnz", "loopz", "jcxz", "jecxz", "jrcxz"}
+
+
+def control_flags(mnemonic: str) -> dict:
+    """Call/ret/jmp флаги по mnemonic, не по CS_GRP_JUMP (он включает jcc)."""
+    m = mnemonic
+    return {
+        "is_call": m == "call",
+        "is_ret": m in ("ret", "retf", "iret", "iretd", "iretq"),
+        "is_uncond_jmp": m == "jmp",
+        "is_cond_jmp": m in COND_JMPS,
+        "is_loop": m in LOOP_INSNS,
+    }
 
 PADDING_MNEMS = {"int3", "nop", "hlt"}
 
@@ -137,7 +207,7 @@ def decode_jump_table_entry(raw: bytes, *, signed: bool) -> int:
 @dataclass
 class PEInfo:
     """Результат парсинга PE."""
-    pe: object
+    raw: bytes
     imagebase: int
     entry_va: int
     sections: list
@@ -150,22 +220,38 @@ class PEInfo:
     has_reloc_dir: bool = False
     func_bounds: list = field(default_factory=list)  # [(begin_va, end_va)] из .pdata
     file_size: int = 0
+    guard_cf: bool = False
+    export_vas: list = field(default_factory=list)
+    tls_callbacks: list = field(default_factory=list)
+
+
+def _va_to_off(sections, va, file_size):
+    for _name, sva, vsize, raw_ptr, raw_size, _is_exec in sections:
+        off = va - sva
+        if 0 <= off < min(vsize or raw_size, raw_size):
+            fo = raw_ptr + off
+            if 0 <= fo < file_size:
+                return fo
+    return None
 
 
 def _parse_pe(path) -> PEInfo:
     import os
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Module1: file not found: {path}")
+    with open(path, "rb") as f:
+        raw = f.read()
     try:
-        pe = pefile.PE(path)
+        pe = pefile.PE(data=raw)
     except pefile.PEFormatError as e:
         raise ValueError(f"Module1: not a valid PE: {path} ({e})")
-    file_size = os.path.getsize(path)
+    file_size = len(raw)
     imagebase = pe.OPTIONAL_HEADER.ImageBase
     entry_va = imagebase + pe.OPTIONAL_HEADER.AddressOfEntryPoint
     is_dll = bool(pe.FILE_HEADER.Characteristics & 0x2000)
     dll_chars = getattr(pe.OPTIONAL_HEADER, "DllCharacteristics", 0) or 0
     dynamic_base = bool(dll_chars & 0x0040)
+    guard_cf = bool(dll_chars & 0x4000)  # IMAGE_DLLCHARACTERISTICS_GUARD_CF
     sections = []
     exec_ranges = []
     for s in pe.sections:
@@ -226,11 +312,43 @@ def _parse_pe(path) -> PEInfo:
         except Exception:
             continue
     func_bounds = sorted(set(func_bounds))
-    return PEInfo(pe=pe, imagebase=imagebase, entry_va=entry_va,
+    export_vas = []
+    try:
+        exp = pe.DIRECTORY_ENTRY_EXPORT
+    except AttributeError:
+        exp = None
+    for e in getattr(exp, "symbols", None) or []:
+        try:
+            if getattr(e, "forwarder", None) or not e.address:
+                continue
+            export_vas.append(imagebase + e.address)
+        except Exception:
+            continue
+    tls_callbacks = []
+    try:
+        tls = pe.DIRECTORY_ENTRY_TLS
+    except AttributeError:
+        tls = None
+    cb_va = 0
+    if tls is not None:
+        cb_va = getattr(tls.struct, "AddressOfCallBacks", 0) or 0
+    if cb_va:
+        for _ in range(64):
+            fo = _va_to_off(sections, cb_va, file_size)
+            if fo is None or fo + 8 > file_size:
+                break
+            val = int.from_bytes(raw[fo:fo + 8], "little")
+            if val == 0:
+                break
+            tls_callbacks.append(val)
+            cb_va += 8
+    return PEInfo(raw=raw, imagebase=imagebase, entry_va=entry_va,
                   sections=sections, exec_ranges=exec_ranges, imports=imports,
                   relocs=relocs, reloc_types=reloc_types, is_dll=is_dll,
                   dynamic_base=dynamic_base, has_reloc_dir=has_reloc_dir,
-                  func_bounds=func_bounds, file_size=file_size)
+                  func_bounds=func_bounds, file_size=file_size,
+                  guard_cf=guard_cf, export_vas=export_vas,
+                  tls_callbacks=tls_callbacks)
 
 
 def disassemble(path: str, cfg: PipelineConfig | None = None,
@@ -251,10 +369,13 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
     is_dll, dynamic_base = info.is_dll, info.dynamic_base
     has_reloc_dir, file_size = info.has_reloc_dir, info.file_size
     func_bounds = info.func_bounds
+    guard_cf = info.guard_cf
+    export_vas = info.export_vas
+    tls_callbacks = info.tls_callbacks
 
     md = Cs(CS_ARCH_X86, CS_MODE_64)
     md.detail = True
-    raw_data = info.pe.__data__
+    raw_data = info.raw
 
     exec_spans = [(va, va + len(code)) for va, _, code, _ in exec_ranges]
     exec_sorted = sorted(exec_ranges)
@@ -315,13 +436,15 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
         ins = Insn(addr=i.address, file_off=file_off, size=i.size,
                    raw=bytes(i.bytes), mnemonic=i.mnemonic, op_str=i.op_str,
                    regs_read=cs_regs_r, regs_write=cs_regs_w,
-                   groups=grp_names, section=sec_name)
+                   groups=grp_names, section=sec_name,
+                   operands=cache_operands(i, md))
         m = i.mnemonic
-        ins.is_call = (m == "call")
-        ins.is_ret = m in ("ret", "retf", "iret", "iretd", "iretq")
-        ins.is_uncond_jmp = (m == "jmp")
-        ins.is_cond_jmp = (m in COND_JMPS)
-        ins.is_loop = (m in LOOP_INSNS)
+        cf = control_flags(m)
+        ins.is_call = cf["is_call"]
+        ins.is_ret = cf["is_ret"]
+        ins.is_uncond_jmp = cf["is_uncond_jmp"]
+        ins.is_cond_jmp = cf["is_cond_jmp"]
+        ins.is_loop = cf["is_loop"]
         ins.is_padding = (m in PADDING_MNEMS)
         if (ins.is_call or ins.is_uncond_jmp or ins.is_cond_jmp or ins.is_loop) and i.operands:
             op = i.operands[0]
@@ -398,19 +521,13 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
         return (None, None)
 
     def resolve_table(ins: Insn, line):
-        det = _deco(ins)
-        if det is None:
-            return None
-        memop = next((op.mem for op in det.operands if op.type == X86_OP_MEM), None)
+        memop = next((op.mem for op in ins.operands if op.type == X86_OP_MEM), None)
         if memop is None:
             return None
         scale = memop.scale or 1
         if scale not in (2, 4, 8):
             return None
-        try:
-            base = md.reg_name(memop.base) if memop.base else None
-        except Exception:
-            base = None
+        base = memop.base
         if base == "rip":
             table_va = ins.rip_ref
         elif base is None:
@@ -434,22 +551,11 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
                           signed=jump_table_entry_is_signed(scale))
         return (table_va, tgts) if tgts else None
 
-    def _deco(ins: Insn):
-        try:
-            return next(md.disasm(ins.raw, ins.addr))
-        except StopIteration:
-            return None
-
     def _writes_of(ins: Insn) -> set:
         ws = {parent(w) for w in ins.regs_write}
-        d = _deco(ins)
-        if d is not None:
-            for op in d.operands:
-                if op.type == X86_OP_REG and (op.access & CS_AC_WRITE):
-                    try:
-                        ws.add(parent(md.reg_name(op.reg)))
-                    except Exception:
-                        pass
+        for op in ins.operands:
+            if op.type == X86_OP_REG and (op.access & CS_AC_WRITE) and op.reg:
+                ws.add(parent(op.reg))
         return ws
 
     def line_lookup(line):
@@ -475,72 +581,46 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
         di = lookup(reg, before_addr)
         if di is None:
             return None
-        d = _deco(di)
-        if d is None or len(d.operands) < 2:
+        if len(di.operands) < 2:
             return None
-        o0, o1 = d.operands[0], d.operands[1]
+        o0, o1 = di.operands[0], di.operands[1]
         if o0.type != X86_OP_REG:
             return None
         if di.mnemonic == "lea":
             mem = o1.mem if o1.type == X86_OP_MEM else None
             if mem is None:
                 return None
-            try:
-                if mem.base == 0 or md.reg_name(mem.base) == "rip":
-                    return di.rip_ref
-                bv = _reg_value(lookup, parent(md.reg_name(mem.base)), di.addr,
-                                depth + 1)
-            except Exception:
-                return None
+            if not mem.base or mem.base == "rip":
+                return di.rip_ref
+            bv = _reg_value(lookup, parent(mem.base), di.addr, depth + 1)
             return None if bv is None else bv + mem.disp
         if di.mnemonic in ("mov", "movabs") and o1.type == X86_OP_IMM:
             return o1.imm
-        if di.mnemonic == "mov" and o1.type == X86_OP_REG:
-            try:
-                return _reg_value(lookup, parent(md.reg_name(o1.reg)), di.addr,
-                                  depth + 1)
-            except Exception:
-                return None
+        if di.mnemonic == "mov" and o1.type == X86_OP_REG and o1.reg:
+            return _reg_value(lookup, parent(o1.reg), di.addr, depth + 1)
         if di.mnemonic == "mov" and o1.type == X86_OP_MEM:
-            try:
-                if o1.mem.base and md.reg_name(o1.mem.base) == "rip" \
-                        and di.rip_ref is not None:
-                    b = read_at(di.rip_ref, 8)
-                    if b is not None:
-                        return int.from_bytes(b, "little")
-            except Exception:
-                pass
+            if o1.mem and o1.mem.base == "rip" and di.rip_ref is not None:
+                b = read_at(di.rip_ref, 8)
+                if b is not None:
+                    return int.from_bytes(b, "little")
             return None
-        if di.mnemonic == "xor" and o1.type == X86_OP_REG:
-            try:
-                if parent(md.reg_name(o0.reg)) == parent(md.reg_name(o1.reg)):
-                    return 0
-            except Exception:
-                pass
+        if di.mnemonic == "xor" and o1.type == X86_OP_REG and o0.reg and o1.reg:
+            if parent(o0.reg) == parent(o1.reg):
+                return 0
         return None
 
     def resolve_reg_jmp(ins: Insn, lookup):
-        d = _deco(ins)
-        if d is None or not d.operands or d.operands[0].type != X86_OP_REG:
+        if not ins.operands or ins.operands[0].type != X86_OP_REG or not ins.operands[0].reg:
             return None
-        try:
-            dst = parent(md.reg_name(d.operands[0].reg))
-        except Exception:
-            return None
+        dst = parent(ins.operands[0].reg)
         di = lookup(dst, ins.addr)
         if di is None:
             return None
-        ddi = _deco(di)
-        if ddi is None:
-            return None
         addend_val = None
         load = None
-        if di.mnemonic == "add" and len(ddi.operands) >= 2 \
-                and ddi.operands[1].type == X86_OP_REG:
-            try:
-                addend = parent(md.reg_name(ddi.operands[1].reg))
-            except Exception:
-                return None
+        if di.mnemonic == "add" and len(di.operands) >= 2 \
+                and di.operands[1].type == X86_OP_REG and di.operands[1].reg:
+            addend = parent(di.operands[1].reg)
             addend_val = _reg_value(lookup, addend, di.addr)
             load = lookup(dst, di.addr)
             if load is None:
@@ -549,20 +629,14 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
             load = di
         if load.mnemonic not in ("mov", "movzx", "movsxd", "movsx"):
             return None
-        dl = _deco(load)
-        if dl is None:
-            return None
-        memop = next((op.mem for op in dl.operands if op.type == X86_OP_MEM), None)
+        memop = next((op.mem for op in load.operands if op.type == X86_OP_MEM), None)
         if memop is None:
             return None
         scale = memop.scale or 1
         if scale not in (2, 4, 8):
             return None
         signed = load.mnemonic in ("movsxd", "movsx")
-        try:
-            base = md.reg_name(memop.base) if memop.base else None
-        except Exception:
-            base = None
+        base = memop.base
         if base == "rip":
             table_va = load.rip_ref
         elif base is not None:
@@ -595,6 +669,8 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
     deferred = []
     seeds = {entry_va}
     seeds.update(b for b, _ in func_bounds)
+    seeds.update(export_vas)
+    seeds.update(tls_callbacks)
     worklist = deque(a for a in sorted(seeds) if in_exec(a))
 
     def _apply_table(ins, res):
@@ -626,8 +702,7 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
             line.append(ins)
 
             if ins.is_uncond_jmp:
-                det_j = _deco(ins)
-                op0 = det_j.operands[0] if det_j is not None and det_j.operands else None
+                op0 = ins.operands[0] if ins.operands else None
                 if op0 is not None and op0.type == X86_OP_IMM:
                     if ins.branch_target is not None and ins.branch_target not in visited:
                         worklist.append(ins.branch_target)
@@ -742,7 +817,9 @@ def disassemble(path: str, cfg: PipelineConfig | None = None,
                         jump_tables=jump_tables,
                         is_dll=is_dll, dynamic_base=dynamic_base,
                         has_reloc_dir=has_reloc_dir, file_size=file_size,
-                        split_on_call=split_on_call)
+                        split_on_call=split_on_call, guard_cf=guard_cf,
+                        export_vas=tuple(export_vas),
+                        tls_callbacks=tuple(tls_callbacks))
 
 
 def _block_ends(ins, split_on_call: bool) -> bool:
@@ -906,7 +983,8 @@ def verify(r: DisasmResult):
 
 def summary(r: DisasmResult) -> str:
     lines = [f"PE: {r.path} base={r.imagebase:#x} entry={r.entry_va:#x}",
-             f"dll={r.is_dll} dynamic_base={r.dynamic_base} has_reloc={r.has_reloc_dir}",
+             f"dll={r.is_dll} dynamic_base={r.dynamic_base} has_reloc={r.has_reloc_dir} "
+             f"guard_cf={r.guard_cf} exports={len(r.export_vas)} tls_cb={len(r.tls_callbacks)}",
              f"sections: {len(r.sections)} insns: {len(r.insns)} blocks: {len(r.blocks)}",
              f"imports: {len(r.imports)} relocs: {len(r.relocs)}"]
     n_call = sum(1 for i in r.insns if i.is_call)
