@@ -12,12 +12,12 @@ import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_GRP_CALL, CS_GRP_RET, CS_GRP_JUMP
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from capstone.x86_const import X86_OP_REG, X86_OP_IMM
 from keystone import Ks, KS_ARCH_X86, KS_MODE_64
 
-from mod1_disasm import disassemble, parent, verify
-from mod2_ir import lift, _effect, recompute_live_after_prefix
+from mod1_disasm import disassemble, parent, verify, control_flags
+from mod2_ir import lift, _effect, recompute_live_after_prefix, _liveness
 from pipeline_config import PipelineConfig
 
 md = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -67,17 +67,13 @@ def effect_of(raw, addr, imports):
         covered += det.size
         if det.mnemonic == "nop":
             continue
-        # Берём control-flow флаги из capstone groups, а не хардкодим False.
-        # Текущие правила control-инструкций не создают, но будущие могут,
-        # и тогда _effect должен это увидеть.
-        gs = set(det.groups)
+        # CS_GRP_JUMP включает jcc — флаги только по mnemonic.
+        cf = control_flags(det.mnemonic)
         fake = SimpleNamespace(
             mnemonic=det.mnemonic, addr=det.address,
             regs_read=tuple(md.reg_name(r) for r in det.regs_read),
             regs_write=tuple(md.reg_name(r) for r in det.regs_write),
-            is_call=CS_GRP_CALL in gs, is_ret=CS_GRP_RET in gs,
-            is_uncond_jmp=CS_GRP_JUMP in gs,
-            is_cond_jmp=False, is_loop=False)
+            **cf)
         eff = _effect(fake, det, md, imports)
         agg_reg_use.update(eff.reg_use)
         agg_reg_def.update(eff.reg_def)
@@ -99,18 +95,18 @@ def effect_of(raw, addr, imports):
 
 
 def mutate(insn):
-    det = next(md.disasm(insn.raw, insn.addr), None)
-    if det is None or len(det.operands) != 2:
+    ops = insn.operands
+    if len(ops) != 2:
         return None
-    o0, o1 = det.operands
-    reg = md.reg_name(o0.reg) if o0.type == X86_OP_REG else None
-    if det.mnemonic == "sub" and reg is not None \
+    o0, o1 = ops
+    reg = o0.reg if o0.type == X86_OP_REG else None
+    if insn.mnemonic == "sub" and reg is not None \
             and o1.type == X86_OP_REG and o1.reg == o0.reg and o0.size >= 4:
         return "sub2xor", f"xor {reg}, {reg}"
-    if det.mnemonic == "test" and reg is not None \
+    if insn.mnemonic == "test" and reg is not None \
             and o1.type == X86_OP_REG and o1.reg == o0.reg:
         return "test2or", f"or {reg}, {reg}"
-    if det.mnemonic == "mov" and reg is not None \
+    if insn.mnemonic == "mov" and reg is not None \
             and o1.type == X86_OP_IMM and o1.imm == 0 and o0.size >= 4:
         return "mov02xor", f"xor {reg}, {reg}"
     return None
@@ -221,7 +217,10 @@ def mutate_pe(src: str, dst: str, cfg: PipelineConfig | None = None,
                 mem_def=frozenset(new_eff.mem_def),
                 stack_delta=new_eff.stack_delta,
             )
-            recompute_live_after_prefix(b, mod, idx)
+            if recompute_live_after_prefix(b, mod, idx):
+                # live_in блока изменился — пересчитать CFG, иначе
+                # upstream live_out останется от оригинала.
+                _liveness(dis, mod)
 
     tmp = dst + ".tmp"
     try:

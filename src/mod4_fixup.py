@@ -17,12 +17,9 @@ import os
 import struct
 import sys
 from bisect import bisect_left
-from types import SimpleNamespace
 
 import pefile
-from capstone import CS_GRP_CALL, CS_GRP_RET, CS_GRP_JUMP
-
-from mod1_disasm import disassemble, verify
+from mod1_disasm import disassemble, verify, as_detail
 from mod2_ir import _effect
 from pipeline_config import PipelineConfig
 
@@ -72,21 +69,11 @@ def diff_offsets(data_o, data_m):
     return offs
 
 
-def _stack_delta(result, addr, md):
+def _stack_delta(result, addr, md=None):
     insn = result.by_addr[addr]
-    det = next(md.disasm(insn.raw, insn.addr), None)
-    if det is None:
-        return None
-    # Control-flow флаги — из capstone groups, не из хардкода.
-    gs = set(det.groups)
-    fake = SimpleNamespace(
-        mnemonic=det.mnemonic, addr=det.address,
-        regs_read=tuple(md.reg_name(r) for r in det.regs_read),
-        regs_write=tuple(md.reg_name(r) for r in det.regs_write),
-        is_call=CS_GRP_CALL in gs, is_ret=CS_GRP_RET in gs,
-        is_uncond_jmp=CS_GRP_JUMP in gs,
-        is_cond_jmp=False, is_loop=False)
-    return _effect(fake, det, md, result.imports).stack_delta
+    # Флаги и операнды — из Mod1 cache. CS_GRP_JUMP включать нельзя:
+    # он срабатывает и на jcc, из-за чего jne выглядел как uncond jmp.
+    return _effect(insn, as_detail(insn), md, result.imports).stack_delta
 
 
 def fixup(orig_path, mut_path, cfg: PipelineConfig | None = None):
@@ -204,18 +191,27 @@ def fixup(orig_path, mut_path, cfg: PipelineConfig | None = None):
     st["with_rip_ref"] = n_rip
 
     if mut_insns:
-        from capstone import Cs, CS_ARCH_X86, CS_MODE_64
-        md = Cs(CS_ARCH_X86, CS_MODE_64)
-        md.detail = True
         n_delta = 0
         for io_, im in mut_insns:
-            do_ = _stack_delta(ro, io_.addr, md)
-            dm_ = _stack_delta(rm, im.addr, md)
+            do_ = _stack_delta(ro, io_.addr)
+            dm_ = _stack_delta(rm, im.addr)
             n_delta += 1
             if do_ != dm_:
                 errs.append(f"insn {io_.addr:#x}: stack delta changed "
                             f"{do_} -> {dm_}")
         st["stack_delta_checked"] = n_delta
+        if getattr(ro, "guard_cf", False):
+            rep["warns"].append(
+                "Control Flow Guard (IMAGE_DLLCHARACTERISTICS_GUARD_CF) is set; "
+                "CFG bitmap is not checked"
+            )
+        begins = {b for b, _ in ro.func_bounds}
+        for io_, _im in mut_insns:
+            if io_.addr in begins:
+                rep["warns"].append(
+                    f"insn {io_.addr:#x}: mutated function entry; "
+                    "unwind/SEH codes are not verified"
+                )
 
     verrs, vwarns = verify(rm)
     for e in verrs:

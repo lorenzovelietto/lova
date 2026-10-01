@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_AC_READ, CS_AC_WRITE
 from capstone.x86_const import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
 
-from mod1_disasm import disassemble, parent, COND_JMPS, LOOP_INSNS
+from mod1_disasm import disassemble, parent, COND_JMPS, LOOP_INSNS, as_detail
 from pipeline_config import PipelineConfig
 
 # Маппинг регистров к 64-битному родителю берётся из mod1_disasm — единый
@@ -25,6 +25,8 @@ GPRS = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
 VEC = tuple(f"xmm{i}" for i in range(16))  # отслеживаем XMM (SSE-скаляры в CRT)
 VOLATILE = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")  # clobbered by call (MS x64)
 VOLATILE_VEC = tuple(f"xmm{i}" for i in range(6))  # XMM0-XMM5 volatile по MS x64
+# Без IPA каждый call консервативно читает все arg-регистры.
+# Занижение uses = сломанный бинарник; завышение = пропущенная мутация.
 ARG_REGS = ("rcx", "rdx", "r8", "r9")  # первые целочисленные аргументы (MS x64)
 ARG_VEC = tuple(f"xmm{i}" for i in range(4))  # первые FP-аргументы (MS x64)
 NON_VOLATILE = {"rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15", "rsp"}
@@ -97,6 +99,32 @@ class IRModule:
     unresolved_tables: list = field(default_factory=list)  # table_va без резолва
 
 
+def _reg_of(op, md) -> str | None:
+    """Имя регистра операнда: CachedOp.reg (str) или capstone id через md."""
+    r = getattr(op, "reg", None)
+    if isinstance(r, str):
+        return r or None
+    if not r:
+        return None
+    try:
+        return md.reg_name(r)
+    except Exception:
+        return None
+
+
+def _mem_regs(m, md) -> tuple:
+    def one(v):
+        if isinstance(v, str):
+            return v or None
+        if not v:
+            return None
+        try:
+            return md.reg_name(v)
+        except Exception:
+            return None
+    return one(getattr(m, "base", None)), one(getattr(m, "index", None))
+
+
 def _full_width(parent_reg: str, size: int) -> bool:
     """Полная ли перезапись: GPR size>=4 (4 обнуляет верх), XMM size>=16."""
     if parent_reg in VEC:
@@ -110,14 +138,7 @@ def _mems_of(detail_insn, md, imports) -> tuple:
         if op.type != X86_OP_MEM:
             continue
         m = op.mem
-        try:
-            base = md.reg_name(m.base) if m.base else None
-        except Exception:
-            base = None
-        try:
-            index = md.reg_name(m.index) if m.index else None
-        except Exception:
-            index = None
+        base, index = _mem_regs(m, md)
         base_p = parent(base) if base and base != "rip" else base
         ref = MemRef(base=base_p,
                      index=parent(index) if index else None,
@@ -135,14 +156,8 @@ def _slot_of_memop(detail_insn, op, md, imports) -> str:
     """Канонический слот памяти для liveness: 's:rsp+0x20', 'g:0x14001abc', 'm:*'.
     Слоты только для точных адресов (stack без индекса / RIP). Остальное — 'm:*'."""
     m = op.mem
-    try:
-        base = md.reg_name(m.base) if m.base else None
-    except Exception:
-        base = None
-    try:
-        has_index = bool(m.index)
-    except Exception:
-        has_index = False
+    base, index = _mem_regs(m, md)
+    has_index = bool(index)
     if base == "rip":
         va = detail_insn.address + detail_insn.size + m.disp
         return f"g:{va:#x}"
@@ -161,10 +176,10 @@ def _effect(insn, detail, md, imports) -> IREffect:
     muse, mdef = set(), set()
     for op in detail.operands:
         if op.type == X86_OP_REG:
-            try:
-                p = parent(md.reg_name(op.reg))
-            except Exception:
+            rn = _reg_of(op, md)
+            if not rn:
                 continue
+            p = parent(rn)
             if p not in _TRACKED:
                 continue  # fs/gs/ymm/zmm и прочее не ведем
             try:
@@ -274,7 +289,7 @@ def _effect(insn, detail, md, imports) -> IREffect:
     if m in ("sub", "add") and len(detail.operands) >= 2:
         try:
             o0, o1 = detail.operands[0], detail.operands[1]
-            if (o0.type == X86_OP_REG and parent(md.reg_name(o0.reg)) == "rsp"
+            if (o0.type == X86_OP_REG and parent(_reg_of(o0, md) or "") == "rsp"
                     and o1.type == X86_OP_IMM):
                 delta = -o1.imm if m == "sub" else o1.imm
                 rsp_imm_exact = True
@@ -293,7 +308,7 @@ def _effect(insn, detail, md, imports) -> IREffect:
             if op.type != X86_OP_REG:
                 continue
             try:
-                is_rsp = parent(md.reg_name(op.reg)) == "rsp"
+                is_rsp = parent(_reg_of(op, md) or "") == "rsp"
                 acc = op.access
             except Exception:
                 continue
@@ -339,13 +354,9 @@ def lift(path: str, cfg: PipelineConfig | None = None,
     md = Cs(CS_ARCH_X86, CS_MODE_64)
     md.detail = True
     mod = IRModule(path=path)
-    # эффекты: пере-декодируем каждую инструкцию из raw для операндов
+    # Операнды уже сняты в Mod1 (CachedOp). Повторный Capstone-проход не нужен.
     for insn in dis.insns:
-        try:
-            det = next(md.disasm(insn.raw, insn.addr))
-        except StopIteration:
-            continue
-        mod.effects[insn.addr] = _effect(insn, det, md, dis.imports)
+        mod.effects[insn.addr] = _effect(insn, as_detail(insn), md, dis.imports)
     # функции: .pdata + прямые call-таргеты вне pdata (inferred).
     # Конец inferred — эвристика: следующее начало функции (pdata или другой
     # таргет), иначе конец exec-диапазона. 1-байтных огрызков больше нет.
@@ -541,13 +552,16 @@ def _step_live_backward(live: set, e: IREffect) -> set:
             | set(e.reg_use) | set(e.flag_use) | set(e.vfp_use))
 
 
-def recompute_live_after_prefix(block, mod: IRModule, mutated_idx: int) -> None:
+def recompute_live_after_prefix(block, mod: IRModule, mutated_idx: int) -> bool:
     """После мутации block.insns[mutated_idx] пересчитать live_after
-    всех предыдущих инструкций блока. live_after самой мутированной
-    инструкции зависит только от хвоста блока и остаётся валидным.
+    предыдущих инструкций и live_in блока.
+
+    live_after самой мутированной инструкции зависит только от хвоста
+    блока и остаётся валидным. Если live_in изменился, возвращает True —
+    вызывающий должен прогнать полный _liveness (upstream live_out).
     """
-    if mutated_idx <= 0:
-        return
+    if not block.insns or mutated_idx < 0 or mutated_idx >= len(block.insns):
+        return False
     insn = block.insns[mutated_idx]
     live = set(mod.live_after.get(insn.addr, set()))
     e = mod.effects.get(insn.addr)
@@ -558,6 +572,11 @@ def recompute_live_after_prefix(block, mod: IRModule, mutated_idx: int) -> None:
         e = mod.effects.get(prev.addr)
         if e is not None:
             live = _step_live_backward(live, e)
+    old_in = mod.live_in.get(block.start, set())
+    if live != old_in:
+        mod.live_in[block.start] = set(live)
+        return True
+    return False
 
 
 def _liveness(dis, mod: IRModule):
