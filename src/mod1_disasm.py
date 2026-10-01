@@ -409,7 +409,9 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
             return (val,) if scale == 8 else (imagebase + val, tv + val)
 
         lo, hi = table_range(ins.addr)
-        tgts = read_table(tv, scale, cand_fn, lo, hi)
+        # scale == 4 / 2 — таблицы знаковых смещений (MSVC/clang pattern):
+        # отрицательные элементы валидны и дают targets слева от таблицы.
+        tgts = read_table(tv, scale, cand_fn, lo, hi, signed=(scale != 8))
         return (table_va, tgts) if tgts else None
 
     def _deco(ins: Insn):
@@ -685,7 +687,8 @@ def disassemble(path: str, split_on_call: bool = True) -> DisasmResult:
                 _trace_from(worklist.popleft())
 
     insns.sort(key=lambda x: x.addr)
-    blocks = _build_blocks(insns, by_addr, split_on_call=split_on_call)
+    blocks = _build_blocks(insns, by_addr, split_on_call=split_on_call,
+                           func_bounds=func_bounds)
 
     covered = []
     for ins in insns:
@@ -729,13 +732,24 @@ def _block_ends(ins, split_on_call: bool) -> bool:
     return False
 
 
-def _build_blocks(insns, by_addr, split_on_call: bool = True):
+def _build_blocks(insns, by_addr, split_on_call: bool = True, func_bounds=()):
     def is_branch(ins):
         return ins.is_cond_jmp or ins.is_uncond_jmp or ins.is_call or ins.is_loop
 
     starts = set()
     if insns:
         starts.add(insns[0].addr)
+    # Начало каждой функции из .pdata — обязательная граница блока:
+    # иначе рядом стоящие в сортированном списке функции могут слиться.
+    for begin, _end in func_bounds:
+        if begin in by_addr:
+            starts.add(begin)
+    # Разрыв адресов между соседними visited-инструкциями (gap/dead code
+    # между трассами, noreturn-call) — тоже граница блока.
+    for k in range(1, len(insns)):
+        prev, cur = insns[k - 1], insns[k]
+        if prev.addr + prev.size != cur.addr:
+            starts.add(cur.addr)
     for ins in insns:
         if is_branch(ins):
             if ins.branch_target is not None and ins.branch_target in by_addr:

@@ -14,13 +14,13 @@ Exit 0 = PASS, 1 = FAIL.
 import argparse
 import gc
 import os
-import re
 import struct
 import sys
 from bisect import bisect_left
 from types import SimpleNamespace
 
 import pefile
+from capstone import CS_GRP_CALL, CS_GRP_RET, CS_GRP_JUMP
 
 from mod1_disasm import disassemble, verify
 from mod2_ir import _effect
@@ -55,15 +55,19 @@ DIFF_CHUNK = 1 << 20
 def diff_offsets(data_o, data_m):
     if data_o == data_m:
         return []
+    # Чанк-сравнение (дешёвое, PE обычно отличается в сотне-другой байт),
+    # а внутри изменённого чанка — байтовый zip. int.from_bytes на мегабайтных
+    # буферах создавал bigint порядка 2**(8*2**20) — ненужная работа.
     offs = []
+    mv_o, mv_m = memoryview(data_o), memoryview(data_m)
     for base in range(0, len(data_o), DIFF_CHUNK):
-        a = data_o[base:base + DIFF_CHUNK]
-        b = data_m[base:base + DIFF_CHUNK]
+        end = min(base + DIFF_CHUNK, len(data_o))
+        a, b = mv_o[base:end], mv_m[base:end]
         if a == b:
             continue
-        x = (int.from_bytes(a, "little") ^ int.from_bytes(b, "little"))
-        x = x.to_bytes(len(a), "little")
-        offs.extend(base + m.start() for m in re.finditer(rb"[^\x00]", x))
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                offs.append(base + i)
     return offs
 
 
@@ -72,11 +76,14 @@ def _stack_delta(result, addr, md):
     det = next(md.disasm(insn.raw, insn.addr), None)
     if det is None:
         return None
+    # Control-flow флаги — из capstone groups, не из хардкода.
+    gs = set(det.groups)
     fake = SimpleNamespace(
         mnemonic=det.mnemonic, addr=det.address,
         regs_read=tuple(md.reg_name(r) for r in det.regs_read),
         regs_write=tuple(md.reg_name(r) for r in det.regs_write),
-        is_call=False, is_ret=False, is_uncond_jmp=False,
+        is_call=CS_GRP_CALL in gs, is_ret=CS_GRP_RET in gs,
+        is_uncond_jmp=CS_GRP_JUMP in gs,
         is_cond_jmp=False, is_loop=False)
     return _effect(fake, det, md, result.imports).stack_delta
 
