@@ -7,15 +7,18 @@
 старшую половину родителя), любое касание памяти сверх оригинала,
 пропавшая запись памяти и изменение stack_delta запрещены.
 """
+import os
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_GRP_CALL, CS_GRP_RET, CS_GRP_JUMP
 from capstone.x86_const import X86_OP_REG, X86_OP_IMM
 from keystone import Ks, KS_ARCH_X86, KS_MODE_64
 
-from mod1_disasm import disassemble, parent
-from mod2_ir import lift, _effect
+from mod1_disasm import disassemble, parent, verify
+from mod2_ir import lift, _effect, recompute_live_after_prefix
+from pipeline_config import PipelineConfig
 
 md = Cs(CS_ARCH_X86, CS_MODE_64)
 md.detail = True
@@ -113,79 +116,122 @@ def mutate(insn):
     return None
 
 
-def mutate_pe(src: str, dst: str) -> dict:
+def mutate_pe(src: str, dst: str, cfg: PipelineConfig | None = None,
+              dis=None, mod=None) -> dict:
     """Пройтись по инструкциям src, применить peephole-правила под гейтом
     liveness и записать мутированный PE в dst. Возвращает счётчики
     applied/blocked по правилам.
+
+    После каждой принятой мутации live_after предыдущих инструкций блока
+    пересчитывается: мутация меняет def/use, и гейт ниже по блоку (раньше
+    по адресу) иначе смотрел бы на устаревшую живость оригинала.
     """
-    dis = disassemble(src)
-    mod = lift(src)
+    cfg = PipelineConfig.from_legacy(cfg=cfg)
+    if dis is None:
+        dis = disassemble(src, cfg=cfg)
+    elif getattr(dis, "split_on_call", cfg.split_on_call) != cfg.split_on_call:
+        raise ValueError(
+            f"DisasmResult.split_on_call={dis.split_on_call} "
+            f"не совпадает с PipelineConfig.split_on_call={cfg.split_on_call}"
+        )
+    verrs, _vwarns = verify(dis)
+    if verrs:
+        raise RuntimeError(
+            "mod1 verify failed, refusing to mutate:\n" + "\n".join(verrs)
+        )
+    if mod is None:
+        mod = lift(src, cfg=cfg, dis=dis)
 
     data = bytearray(open(src, "rb").read())
     applied, blocked = {}, {}
-    for insn in dis.insns:
-        rule = mutate(insn)
-        if not rule:
-            continue
-        rule, new_asm = rule
-        old_eff = mod.effects.get(insn.addr)
-        if old_eff is None:
-            continue
-        try:
-            new_bytes = asm(new_asm)
-        except Exception:
-            continue
-        if len(new_bytes) > insn.size:
-            continue
-        new_bytes = pad(new_bytes, insn.size)
-        if not new_bytes:
-            continue
-        new_eff = effect_of(new_bytes, insn.addr, dis.imports)
-        if new_eff is None:
-            blocked[rule] = blocked.get(rule, 0) + 1
-            continue
-        live = mod.live_after.get(insn.addr, set())
-        old_defs = old_eff.reg_def | old_eff.flag_def
-        new_defs = new_eff.reg_def | new_eff.flag_def
-        old_uses = old_eff.reg_use | old_eff.flag_use
-        new_uses = new_eff.reg_use | new_eff.flag_use
+    # С конца блока: live_after[i] зависит от эффектов i+1..end.
+    # Мутация хвоста инвалидирует живость префикса — префикс ещё не трогали.
+    for b in dis.blocks:
+        for idx in range(len(b.insns) - 1, -1, -1):
+            insn = b.insns[idx]
+            rule = mutate(insn)
+            if not rule:
+                continue
+            rule, new_asm = rule
+            old_eff = mod.effects.get(insn.addr)
+            if old_eff is None:
+                continue
+            try:
+                new_bytes = asm(new_asm)
+            except Exception:
+                continue
+            if len(new_bytes) > insn.size:
+                continue
+            new_bytes = pad(new_bytes, insn.size)
+            if not new_bytes:
+                continue
+            new_eff = effect_of(new_bytes, insn.addr, dis.imports)
+            if new_eff is None:
+                blocked[rule] = blocked.get(rule, 0) + 1
+                continue
+            live = mod.live_after.get(insn.addr, set())
+            old_defs = old_eff.reg_def | old_eff.flag_def
+            new_defs = new_eff.reg_def | new_eff.flag_def
+            old_uses = old_eff.reg_use | old_eff.flag_use
+            new_uses = new_eff.reg_use | new_eff.flag_use
 
-        excused_read, identity_write = set(), set()
-        det_new = next(md.disasm(new_bytes, insn.addr), None)
-        if det_new is not None and len(det_new.operands) == 2 \
-                and det_new.operands[0].type == X86_OP_REG \
-                and det_new.operands[1].type == X86_OP_REG \
-                and det_new.operands[0].reg == det_new.operands[1].reg:
-            p = parent(md.reg_name(det_new.operands[0].reg))
-            if det_new.mnemonic in ("xor", "sub"):
-                excused_read.add(p)
-            elif det_new.mnemonic in ("or", "and") and det_new.operands[0].size != 4:
-                identity_write.add(p)
+            excused_read, identity_write = set(), set()
+            det_new = next(md.disasm(new_bytes, insn.addr), None)
+            if det_new is not None and len(det_new.operands) == 2 \
+                    and det_new.operands[0].type == X86_OP_REG \
+                    and det_new.operands[1].type == X86_OP_REG \
+                    and det_new.operands[0].reg == det_new.operands[1].reg:
+                p = parent(md.reg_name(det_new.operands[0].reg))
+                if det_new.mnemonic in ("xor", "sub"):
+                    excused_read.add(p)
+                elif det_new.mnemonic in ("or", "and") and det_new.operands[0].size != 4:
+                    identity_write.add(p)
 
-        new_defs_eff = new_defs - identity_write
-        new_uses_eff = new_uses - excused_read
+            new_defs_eff = new_defs - identity_write
+            new_uses_eff = new_uses - excused_read
 
-        old_mem = old_eff.mem_use | old_eff.mem_def
-        new_mem = new_eff.mem_use | new_eff.mem_def
+            old_mem = old_eff.mem_use | old_eff.mem_def
+            new_mem = new_eff.mem_use | new_eff.mem_def
 
-        if ((new_defs_eff - old_defs) & live
-                or (old_defs - new_defs_eff) & live
-                or (new_uses_eff - old_uses)
-                or (new_mem - old_mem)
-                or old_eff.mem_def - new_eff.mem_def
-                or new_eff.stack_delta != old_eff.stack_delta):
-            blocked[rule] = blocked.get(rule, 0) + 1
-            continue
-        file_off = insn.file_off
-        old_bytes = data[file_off:file_off + insn.size]
-        if bytes(new_bytes) == bytes(old_bytes):
-            continue
-        print(f"{insn.addr:#x}: {insn.mnemonic} {insn.op_str} ({old_bytes.hex()}) "
-              f"-> {new_asm} ({new_bytes.hex()})")
-        data[file_off:file_off + insn.size] = new_bytes
-        applied[rule] = applied.get(rule, 0) + 1
+            if ((new_defs_eff - old_defs) & live
+                    or (old_defs - new_defs_eff) & live
+                    or (new_uses_eff - old_uses)
+                    or (new_mem - old_mem)
+                    or old_eff.mem_def - new_eff.mem_def
+                    or new_eff.stack_delta != old_eff.stack_delta):
+                blocked[rule] = blocked.get(rule, 0) + 1
+                continue
+            file_off = insn.file_off
+            old_bytes = data[file_off:file_off + insn.size]
+            if bytes(new_bytes) == bytes(old_bytes):
+                continue
+            print(f"{insn.addr:#x}: {insn.mnemonic} {insn.op_str} ({old_bytes.hex()}) "
+                  f"-> {new_asm} ({new_bytes.hex()})")
+            data[file_off:file_off + insn.size] = new_bytes
+            applied[rule] = applied.get(rule, 0) + 1
+            # Обновляем эффект и живость префикса блока: следующая (более
+            # ранняя по адресу) мутация должна видеть новый def/use.
+            mod.effects[insn.addr] = replace(
+                old_eff,
+                reg_use=frozenset(new_eff.reg_use),
+                reg_def=frozenset(new_eff.reg_def),
+                flag_use=frozenset(new_eff.flag_use),
+                flag_def=frozenset(new_eff.flag_def),
+                mem_use=frozenset(new_eff.mem_use),
+                mem_def=frozenset(new_eff.mem_def),
+                stack_delta=new_eff.stack_delta,
+            )
+            recompute_live_after_prefix(b, mod, idx)
 
-    open(dst, "wb").write(data)
+    tmp = dst + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dst)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     for rule in sorted(set(applied) | set(blocked)):
         print(f"{rule}: applied={applied.get(rule, 0)} blocked_by_liveness={blocked.get(rule, 0)}")
     print(f"patched {sum(applied.values())} insns -> {dst}")

@@ -15,6 +15,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_AC_READ, CS_AC_WRITE
 from capstone.x86_const import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
 
 from mod1_disasm import disassemble, parent, COND_JMPS, LOOP_INSNS
+from pipeline_config import PipelineConfig
 
 # Маппинг регистров к 64-битному родителю берётся из mod1_disasm — единый
 # источник, чтобы liveness не разъехалась при изменении таблицы в одном модуле.
@@ -27,7 +28,8 @@ VOLATILE_VEC = tuple(f"xmm{i}" for i in range(6))  # XMM0-XMM5 volatile по MS 
 ARG_REGS = ("rcx", "rdx", "r8", "r9")  # первые целочисленные аргументы (MS x64)
 ARG_VEC = tuple(f"xmm{i}" for i in range(4))  # первые FP-аргументы (MS x64)
 NON_VOLATILE = {"rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15", "rsp"}
-RET_LIVE = frozenset({"rax", "rdx", "xmm0"} | NON_VOLATILE)
+NON_VOLATILE_VEC = frozenset(f"xmm{i}" for i in range(6, 16))  # XMM6–XMM15 callee-saved (MS x64)
+RET_LIVE = frozenset({"rax", "rdx", "xmm0"} | NON_VOLATILE | NON_VOLATILE_VEC)
 _TRACKED = frozenset(GPRS) | frozenset(VEC)  # остальное (fs/gs/ymm/zmm/rip) не ведем
 FLAGS = ("zf", "sf", "cf", "of", "pf", "af", "df")
 ARITH_FLAGS = ("zf", "sf", "cf", "of", "pf", "af")  # add/sub/cmp (без DF)
@@ -324,8 +326,16 @@ def _effect(insn, detail, md, imports) -> IREffect:
                     mems=mems, stack_delta=delta, is_control=eff.is_control)
 
 
-def lift(path: str, split_on_call: bool = True) -> IRModule:
-    dis = disassemble(path, split_on_call=split_on_call)
+def lift(path: str, cfg: PipelineConfig | None = None,
+         split_on_call: bool | None = None, dis=None) -> IRModule:
+    cfg = PipelineConfig.from_legacy(split_on_call, cfg)
+    if dis is None:
+        dis = disassemble(path, cfg=cfg)
+    elif getattr(dis, "split_on_call", cfg.split_on_call) != cfg.split_on_call:
+        raise ValueError(
+            f"DisasmResult.split_on_call={dis.split_on_call} "
+            f"не совпадает с PipelineConfig.split_on_call={cfg.split_on_call}"
+        )
     md = Cs(CS_ARCH_X86, CS_MODE_64)
     md.detail = True
     mod = IRModule(path=path)
@@ -524,6 +534,32 @@ def _vfp_slot(slot: str, off: int) -> str:
     return slot
 
 
+def _step_live_backward(live: set, e: IREffect) -> set:
+    """Один шаг backward-liveness через эффект инструкции. m:* не убивает."""
+    safe_mdef = set(e.vfp_def) - {"m:*"}
+    return ((live - set(e.reg_def) - set(e.flag_def) - safe_mdef)
+            | set(e.reg_use) | set(e.flag_use) | set(e.vfp_use))
+
+
+def recompute_live_after_prefix(block, mod: IRModule, mutated_idx: int) -> None:
+    """После мутации block.insns[mutated_idx] пересчитать live_after
+    всех предыдущих инструкций блока. live_after самой мутированной
+    инструкции зависит только от хвоста блока и остаётся валидным.
+    """
+    if mutated_idx <= 0:
+        return
+    insn = block.insns[mutated_idx]
+    live = set(mod.live_after.get(insn.addr, set()))
+    e = mod.effects.get(insn.addr)
+    if e is not None:
+        live = _step_live_backward(live, e)
+    for prev in reversed(block.insns[:mutated_idx]):
+        mod.live_after[prev.addr] = set(live)
+        e = mod.effects.get(prev.addr)
+        if e is not None:
+            live = _step_live_backward(live, e)
+
+
 def _liveness(dis, mod: IRModule):
     """Backward dataflow по regs+flags+VFP-слотам. m:* kill запрещен."""
     use_b, def_b = {}, {}
@@ -565,10 +601,7 @@ def _liveness(dis, mod: IRModule):
             mod.live_after[insn.addr] = set(live)
             e = mod.effects.get(insn.addr)
             if e is not None:
-                # m:* в kill запрещен и тут (см. выше)
-                safe_mdef = set(e.vfp_def) - {"m:*"}
-                live = ((live - set(e.reg_def) - set(e.flag_def) - safe_mdef)
-                        | set(e.reg_use) | set(e.flag_use) | set(e.vfp_use))
+                live = _step_live_backward(live, e)
 
 
 def summary(mod: IRModule) -> str:

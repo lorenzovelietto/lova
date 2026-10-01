@@ -23,6 +23,7 @@ from mod1_disasm import disassemble, verify   # noqa: E402
 from mod2_ir import lift                      # noqa: E402
 from mod3_morph import mutate_pe              # noqa: E402
 from mod4_fixup import fixup, apply_checksum  # noqa: E402
+from pipeline_config import PipelineConfig    # noqa: E402
 
 
 def _print_mod1(dis):
@@ -60,31 +61,38 @@ def _print_mod4(rep):
 
 
 def run(orig: str, mutated: str | None, apply_checksum_flag: bool,
-        keep_mutated: bool) -> int:
+        keep_mutated: bool, split_on_call: bool = True) -> int:
     cleanup_mut = False
     if mutated is None:
         fd, mutated = tempfile.mkstemp(suffix=".exe", prefix="lova_mut_")
         os.close(fd)
         cleanup_mut = not keep_mutated
 
+    cfg = PipelineConfig(split_on_call=split_on_call)
     print(f"orig: {orig}")
     print(f"mutated: {mutated}")
+    print(f"config: split_on_call={cfg.split_on_call}")
 
-    dis = disassemble(orig)
+    dis = disassemble(orig, cfg=cfg)
     _print_mod1(dis)
-    warns = verify(dis)
+    errs, warns = verify(dis)
+    if errs:
+        print(f"[mod1-verify] {len(errs)} ERRORS — abort")
+        for e in errs[:10]:
+            print(f"  ERR: {e}")
+        return 1
     if warns:
         print(f"[mod1-verify] {len(warns)} warnings")
         for w in warns[:5]:
             print(f"  {w}")
 
-    mod = lift(orig)
+    mod = lift(orig, cfg=cfg, dis=dis)
     _print_mod2(mod)
 
-    stats = mutate_pe(orig, mutated)
+    stats = mutate_pe(orig, mutated, cfg=cfg, dis=dis, mod=mod)
     _print_mod3(stats)
 
-    rep = fixup(orig, mutated)
+    rep = fixup(orig, mutated, cfg=cfg)
     _print_mod4(rep)
     rc = 0 if not rep.get("errors") else 1
 
@@ -108,8 +116,11 @@ def main(argv=None):
                     help="Patch PE OptionalHeader checksum after fixup")
     ap.add_argument("--keep-mutated", action="store_true",
                     help="Do not delete the temp mutated PE on success")
+    ap.add_argument("--ir-blocks", action="store_true",
+                    help="Классические basic blocks (split_on_call=False) во всех модулях")
     args = ap.parse_args(argv)
-    return run(args.orig, args.out, args.apply_checksum, args.keep_mutated)
+    return run(args.orig, args.out, args.apply_checksum, args.keep_mutated,
+               split_on_call=not args.ir_blocks)
 
 
 if __name__ == "__main__":
